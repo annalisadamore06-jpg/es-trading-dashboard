@@ -15,9 +15,9 @@ class IBSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="IB_")
     
     host: str = Field(default="127.0.0.1", description="TWS/Gateway host")
-    port: int = Field(default=7497, description="TWS port (7497) or Gateway port (4001)")
+    port: int = Field(default=7496, description="TWS port (7496) or Gateway port (4001)")
     client_id: int = Field(
-        default_factory=lambda: random.randint(1000, 9999),
+        default_factory=lambda: random.randint(100, 999),
         description="Unique client ID for IB connection"
     )
     timeout: int = Field(default=30, description="Connection timeout in seconds")
