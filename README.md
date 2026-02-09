@@ -36,7 +36,7 @@ es-trading-dashboard/
 │   │   └── atm_range.py       # Calcolo ATM range
 │   ├── ui/
 │   │   ├── __init__.py
-│   │   ├── app.py             # Streamlit main app
+│   │   ├── app.py             # Dash main app
 │   │   ├── components/        # UI components riutilizzabili
 │   │   └── styles.py          # Styling dashboard
 │   └── utils/
@@ -57,10 +57,12 @@ es-trading-dashboard/
 
 ### 📦 Dipendenze Principali
 - `ib_insync` - Connessione Interactive Brokers
-- `streamlit` - Dashboard UI
+- `dash` - Dashboard UI (Plotly)
+- `dash-bootstrap-components` - UI components
 - `pandas` - Data manipulation
 - `numpy` - Calcoli numerici
 - `pydantic` - Validazione config
+- `openpyxl` - Export Excel
 - `pytest` - Testing
 
 ### ⚙️ Configurazione IB
@@ -69,7 +71,75 @@ es-trading-dashboard/
 - **Timeout:** 10 secondi
 - **Auto-reconnect:** Sì
 
-### 🚀 Fasi di Sviluppo
+---
+
+## ⛔ REGOLA CRITICA: NO SNAPSHOT!
+
+```python
+# ═══════════════════════════════════════════════════════════════════
+# ⛔ VIETATO - COSTA SOLDI:
+#   snapshot=True           → $0.01/richiesta
+#   regulatorySnapshot=True → $0.03/richiesta
+#
+# ✅ OBBLIGATORIO - GRATIS CON SOTTOSCRIZIONE:
+#   snapshot=False
+#   regulatorySnapshot=False
+# ═══════════════════════════════════════════════════════════════════
+
+ticker = ib.reqMktData(
+    contract,
+    genericTickList="233",   # RTVolume → VWAP
+    snapshot=False,          # ✅ SEMPRE FALSE!
+    regulatorySnapshot=False # ✅ SEMPRE FALSE!
+)
+```
+
+---
+
+## 🧮 CALCOLI BLINDATI
+
+### Straddle & IV
+```
+Straddle ASK ATM = Call ASK + Put ASK
+IV% Straddle = (Straddle ASK × 100) / VWAP
+```
+
+### Range R1 (IV%)
+```
+R1 UP   = VWAP + (VWAP × IV%)
+R1 DOWN = VWAP - (VWAP × IV%)
+```
+
+### Range R2 (Straddle)
+```
+R2 UP   = VWAP + (VWAP × IV% Straddle)
+R2 DOWN = VWAP - (VWAP × IV% Straddle)
+```
+
+### DVS
+```
+DVS = (Punti Straddle / Punti VI) × 100
+```
+
+### Estensioni Fibonacci
+```
+FIBO EST UP   = VWAP + (Punti × 161.8%)
+FIBO EST DOWN = VWAP - (Punti × 61.8%)
+```
+
+---
+
+## ⏰ AUTO-SALVATAGGIO
+
+| Orario | Azione |
+|--------|--------|
+| 10:00 CET | Salva ES RANGE 10:00 |
+| 15:30 CET | Salva RANGE SPX + ES 15:30 |
+| 15:45 CET | Salva snapshot 15 min dopo apertura |
+
+---
+
+## 🚀 Fasi di Sviluppo
 
 #### Fase 1: Foundation ✅
 - [x] Setup progetto (pyproject.toml)
@@ -77,30 +147,30 @@ es-trading-dashboard/
 - [x] Config centralizzata
 - [x] README con piano
 
-#### Fase 2: Connessione IB
-- [ ] Modulo connection.py
-- [ ] Gestione errori IB
-- [ ] Test connessione
+#### Fase 2: Connessione IB ✅
+- [x] Modulo connection.py
+- [x] Gestione errori IB
+- [x] Custom exceptions
 
 #### Fase 3: Data Collection
-- [ ] Market data subscriptions
+- [ ] Market data subscriptions (NO SNAPSHOT!)
 - [ ] Options chain fetcher
 - [ ] Caching dati
 
 #### Fase 4: Calcoli
-- [ ] Greeks calculation
-- [ ] VWAP calculation
-- [ ] ATM range logic
+- [ ] Range R1/R2 calculation
+- [ ] DVS calculation
+- [ ] Fibonacci extensions
 
-#### Fase 5: Dashboard UI
-- [ ] Layout Streamlit
-- [ ] Options chain table
-- [ ] Real-time updates
+#### Fase 5: Dashboard UI (Dash)
+- [ ] Layout Dash
+- [ ] Components range
+- [ ] Real-time updates (10 sec)
 
 #### Fase 6: Polish
 - [ ] Launcher script
+- [ ] Excel export
 - [ ] Documentazione
-- [ ] CI/CD
 
 ---
 
@@ -113,18 +183,3 @@ pip install -e .
 # Run dashboard
 python -m es_trading_dashboard
 ```
-
----
-
-## 📝 Note Tecniche
-
-### Convivenza con ATAS
-- ATAS usa clientId=1 sulla porta 7496
-- Questa dashboard usa clientId nel range 100-999
-- Se errore 326 (clientId in uso), il sistema prova automaticamente il prossimo ID
-
-### Struttura Codice
-- **Type hints** ovunque
-- **Docstrings** per ogni funzione pubblica
-- **Logging** strutturato
-- **Tests** per ogni modulo
