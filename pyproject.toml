@@ -12,7 +12,7 @@ license = {text = "MIT"}
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
-keywords = ["trading", "options", "interactive-brokers", "dashboard", "streamlit"]
+keywords = ["trading", "options", "interactive-brokers", "dashboard", "dash"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Financial and Insurance Industry",
@@ -22,7 +22,8 @@ classifiers = [
 
 dependencies = [
     "ib_insync>=0.9.86",
-    "streamlit>=1.32.0",
+    "dash>=2.14.0",
+    "dash-bootstrap-components>=1.5.0",
     "pandas>=2.2.0",
     "numpy>=1.26.0",
     "plotly>=5.18.0",
@@ -31,30 +32,32 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "loguru>=0.7.2",
     "pytz>=2024.1",
+    "openpyxl>=3.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "black>=24.0.0",
     "ruff>=0.2.0",
-    "mypy>=1.8.0",
-    "pre-commit>=3.6.0",
 ]
 
 [project.scripts]
-es-dashboard = "es_trading_dashboard.cli:main"
+es-dashboard = "es_trading_dashboard.ui.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/es_trading_dashboard"]
+
+[tool.black]
+line-length = 88
+target-version = ["py311", "py312"]
 
 [tool.ruff]
-line-length = 100
-target-version = "py311"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "N", "W", "UP"]
-
-[tool.mypy]
-python_version = "3.11"
-strict = true
+line-length = 88
+select = ["E", "F", "W", "I", "N"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests"]
