@@ -6,10 +6,12 @@ from .exceptions import (
     IBTimeoutError,
     ConfigurationError,
 )
+from .connection import IBConnection
 
 __all__ = [
     "Config",
     "IBConnectionError",
     "IBTimeoutError",
     "ConfigurationError",
+    "IBConnection",
 ]
