@@ -1,4 +1,5 @@
 # es-trading-dashboard
+
 Real-time ES/SPX options trading dashboard with Interactive Brokers integration
 
 ---
@@ -6,14 +7,144 @@ Real-time ES/SPX options trading dashboard with Interactive Brokers integration
 ## 📋 Project Plan
 
 ### 🎯 Obiettivo
+
 Creare una dashboard di trading real-time per ES/SPX options che:
 - Si connette a Interactive Brokers via `ib_insync`
-- Mostra catena opzioni SPX con Greeks
-- Calcola ATM range basato su OPEN SPX
-- Visualizza VWAP e altri indicatori
+- Mostra catena opzioni ES/SPX 0DTE con Greeks
+- Calcola ATM range con due logiche: VWAP (mattina) e OPEN SPX (pomeriggio)
 - Gestisce correttamente la convivenza con ATAS (porta 7496, clientId 100-999)
 
-### 🏗️ Architettura
+---
+
+## ⏰ LOGICA TEMPORALE (ORARIO ROMA/CET)
+
+### 🌅 MATTINA (02:15 - 15:30 CET)
+**Range calcolati su VWAP di ES**
+
+- ES è un future → ha volume → ha il **VWAP**
+- SPX è un indice → **NON ha VWAP**
+- I range della mattina si calcolano direttamente su ES usando il suo VWAP
+- Nessuna conversione necessaria, i livelli sono già su ES
+
+### 🌆 POMERIGGIO (dalle 15:30 CET - apertura mercati US)
+**Range calcolati su OPEN di SPX**
+
+- Alle 15:30 CET si registra l'**OPEN di SPX**
+- I range si calcolano sull'OPEN di SPX
+- I livelli vengono poi **convertiti su ES** aggiungendo lo SPREAD
+- **SPREAD = ES Last - SPX Last**
+- Livello ES = Livello SPX + SPREAD
+
+### 🎰 ES OPTIONS 0DTE
+- **Apertura:** 02:15 CET
+- **Scadenza:** 22:00 CET
+- **Strike spacing:** ogni 5 punti (5900, 5905, 5910...)
+- **ATM Strike:** `round(ES_Last / 5) * 5`
+
+### 📊 SPX OPTIONS 0DTE
+- **Strike spacing:** ogni 5 punti (6100, 6105, 6110...)
+- **ATM Strike:** `round(SPX_Last / 5) * 5`
+
+---
+
+## 🧮 CALCOLI BLINDATI
+
+### Straddle ATM (sempre sulla strike più vicina al prezzo)
+```
+Straddle ASK = Call ASK + Put ASK
+Straddle BID = Call BID + Put BID
+Straddle SPREAD = Straddle ASK - Straddle BID
+```
+
+### IV% Straddle
+```
+# MATTINA (su VWAP ES)
+IV% Straddle = (Straddle ASK × 100) / ES_VWAP
+
+# POMERIGGIO (su OPEN SPX)
+IV% Straddle = (Straddle ASK × 100) / SPX_OPEN
+```
+
+### Range R1 (basato su IV%)
+```
+# MATTINA
+R1 UP = ES_VWAP + (ES_VWAP × IV%)
+R1 DOWN = ES_VWAP - (ES_VWAP × IV%)
+
+# POMERIGGIO (calcolo su SPX, poi conversione)
+R1 UP (SPX) = SPX_OPEN + (SPX_OPEN × IV%)
+R1 DOWN (SPX) = SPX_OPEN - (SPX_OPEN × IV%)
+R1 UP (ES) = R1 UP (SPX) + SPREAD
+R1 DOWN (ES) = R1 DOWN (SPX) + SPREAD
+```
+
+### Range R2 (basato su IV% Straddle)
+```
+# MATTINA
+R2 UP = ES_VWAP + (ES_VWAP × IV% Straddle)
+R2 DOWN = ES_VWAP - (ES_VWAP × IV% Straddle)
+
+# POMERIGGIO (calcolo su SPX, poi conversione)
+R2 UP (SPX) = SPX_OPEN + (SPX_OPEN × IV% Straddle)
+R2 DOWN (SPX) = SPX_OPEN - (SPX_OPEN × IV% Straddle)
+R2 UP (ES) = R2 UP (SPX) + SPREAD
+R2 DOWN (ES) = R2 DOWN (SPX) + SPREAD
+```
+
+### DVS
+```
+DVS = (Punti Straddle / Punti VI) × 100
+```
+
+### Estensioni Fibonacci
+```
+# MATTINA
+FIBO EST R1 UP = ES_VWAP + (Punti R1 × 161.8%)
+FIBO EST R1 DOWN = ES_VWAP - (Punti R1 × 61.8%)
+
+# POMERIGGIO (su SPX poi convertito)
+FIBO EST R1 UP (SPX) = SPX_OPEN + (Punti R1 × 161.8%)
+FIBO EST R1 DOWN (SPX) = SPX_OPEN - (Punti R1 × 61.8%)
+# Poi + SPREAD per avere su ES
+```
+
+---
+
+## ⛔ REGOLA CRITICA: NO SNAPSHOT!
+
+```python
+# ═══════════════════════════════════════════════════════════════════
+# ⛔ VIETATO - COSTA SOLDI:
+# snapshot=True → $0.01/richiesta
+# regulatorySnapshot=True → $0.03/richiesta
+#
+# ✅ OBBLIGATORIO - GRATIS CON SOTTOSCRIZIONE:
+# snapshot=False
+# regulatorySnapshot=False
+# ═══════════════════════════════════════════════════════════════════
+
+ticker = ib.reqMktData(
+    contract,
+    genericTickList="233",   # RTVolume → VWAP
+    snapshot=False,          # ✅ SEMPRE FALSE!
+    regulatorySnapshot=False # ✅ SEMPRE FALSE!
+)
+```
+
+---
+
+## ⏰ AUTO-SALVATAGGIO
+
+| Orario CET | Azione |
+|------------|--------|
+| 10:00 | Salva ES RANGE 10:00 (basato su VWAP ES) |
+| 15:30 | Registra SPX OPEN + Salva RANGE SPX/ES 15:30 |
+| 15:45 | Salva snapshot 15 min dopo apertura US |
+| Ogni 10s | Log in database (VWAP, IV%, Straddle, DVS, P/C Ratio) |
+
+---
+
+## 🏗️ Architettura
 
 ```
 es-trading-dashboard/
@@ -32,8 +163,8 @@ es-trading-dashboard/
 │   ├── calculations/
 │   │   ├── __init__.py
 │   │   ├── greeks.py          # Calcolo Greeks
-│   │   ├── vwap.py            # Calcolo VWAP
-│   │   └── atm_range.py       # Calcolo ATM range
+│   │   ├── ranges.py          # Calcolo R1/R2/FIBO
+│   │   └── atm.py             # Calcolo ATM strike
 │   ├── ui/
 │   │   ├── __init__.py
 │   │   ├── app.py             # Dash main app
@@ -55,7 +186,10 @@ es-trading-dashboard/
 └── .gitignore
 ```
 
-### 📦 Dipendenze Principali
+---
+
+## 📦 Dipendenze Principali
+
 - `ib_insync` - Connessione Interactive Brokers
 - `dash` - Dashboard UI (Plotly)
 - `dash-bootstrap-components` - UI components
@@ -65,77 +199,15 @@ es-trading-dashboard/
 - `openpyxl` - Export Excel
 - `pytest` - Testing
 
-### ⚙️ Configurazione IB
+---
+
+## ⚙️ Configurazione IB
+
 - **Porta:** 7496 (TWS paper/live)
 - **ClientId range:** 100-999 (evita conflitto con ATAS su ID 1)
-- **Timeout:** 10 secondi
+- **Timeout:** 30 secondi
 - **Auto-reconnect:** Sì
-
----
-
-## ⛔ REGOLA CRITICA: NO SNAPSHOT!
-
-```python
-# ═══════════════════════════════════════════════════════════════════
-# ⛔ VIETATO - COSTA SOLDI:
-#   snapshot=True           → $0.01/richiesta
-#   regulatorySnapshot=True → $0.03/richiesta
-#
-# ✅ OBBLIGATORIO - GRATIS CON SOTTOSCRIZIONE:
-#   snapshot=False
-#   regulatorySnapshot=False
-# ═══════════════════════════════════════════════════════════════════
-
-ticker = ib.reqMktData(
-    contract,
-    genericTickList="233",   # RTVolume → VWAP
-    snapshot=False,          # ✅ SEMPRE FALSE!
-    regulatorySnapshot=False # ✅ SEMPRE FALSE!
-)
-```
-
----
-
-## 🧮 CALCOLI BLINDATI
-
-### Straddle & IV
-```
-Straddle ASK ATM = Call ASK + Put ASK
-IV% Straddle = (Straddle ASK × 100) / VWAP
-```
-
-### Range R1 (IV%)
-```
-R1 UP   = VWAP + (VWAP × IV%)
-R1 DOWN = VWAP - (VWAP × IV%)
-```
-
-### Range R2 (Straddle)
-```
-R2 UP   = VWAP + (VWAP × IV% Straddle)
-R2 DOWN = VWAP - (VWAP × IV% Straddle)
-```
-
-### DVS
-```
-DVS = (Punti Straddle / Punti VI) × 100
-```
-
-### Estensioni Fibonacci
-```
-FIBO EST UP   = VWAP + (Punti × 161.8%)
-FIBO EST DOWN = VWAP - (Punti × 61.8%)
-```
-
----
-
-## ⏰ AUTO-SALVATAGGIO
-
-| Orario | Azione |
-|--------|--------|
-| 10:00 CET | Salva ES RANGE 10:00 |
-| 15:30 CET | Salva RANGE SPX + ES 15:30 |
-| 15:45 CET | Salva snapshot 15 min dopo apertura |
+- **Read-only:** Sì (no trading)
 
 ---
 
@@ -154,22 +226,27 @@ FIBO EST DOWN = VWAP - (Punti × 61.8%)
 
 #### Fase 3: Data Collection
 - [ ] Market data subscriptions (NO SNAPSHOT!)
-- [ ] Options chain fetcher
+- [ ] Options chain fetcher (0DTE automatico)
+- [ ] ATM tracking dinamico
 - [ ] Caching dati
 
 #### Fase 4: Calcoli
-- [ ] Range R1/R2 calculation
+- [ ] Range R1/R2 calculation (mattina/pomeriggio)
 - [ ] DVS calculation
 - [ ] Fibonacci extensions
+- [ ] SPREAD ES-SPX tracking
 
 #### Fase 5: Dashboard UI (Dash)
-- [ ] Layout Dash
-- [ ] Components range
-- [ ] Real-time updates (10 sec)
+- [ ] Layout Dash (come da foto)
+- [ ] Sezione MERCATO LIVE
+- [ ] Sezione RANGE (mattina/pomeriggio)
+- [ ] Sezione VOLATILITA'
+- [ ] Log table (ogni 10 sec)
+- [ ] Real-time updates
 
 #### Fase 6: Polish
 - [ ] Launcher script
-- [ ] Excel export
+- [ ] Excel export (ogni 10 sec)
 - [ ] Documentazione
 
 ---
