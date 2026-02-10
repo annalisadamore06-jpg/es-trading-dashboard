@@ -40,10 +40,47 @@ Creare una dashboard di trading real-time per ES/SPX options che:
 - **Scadenza:** 22:00 CET
 - **Strike spacing:** ogni 5 punti (5900, 5905, 5910...)
 - **ATM Strike:** `round(ES_Last / 5) * 5`
+- La chain 0DTE va trovata **automaticamente** dal sistema
 
 ### 📊 SPX OPTIONS 0DTE
 - **Strike spacing:** ogni 5 punti (6100, 6105, 6110...)
 - **ATM Strike:** `round(SPX_Last / 5) * 5`
+
+---
+
+## 📡 DATI IB - ORIGINE E CHIAMATE API
+
+### ES_VWAP (VWAP intraday del future ES)
+```python
+# 📌 Origine IB: ticker.vwap
+# genericTickList='233' = RTVolume → popola ticker.vwap
+t_es = ib.reqMktData(es, genericTickList='233', snapshot=False)
+# Poi leggi: t_es.vwap
+```
+- **IMPORTANTE:** Il VWAP viene da RTVolume (tick type 233)
+- Solo ES ha il VWAP (è un future con volume)
+- SPX è un indice e NON ha VWAP
+
+### IV% Daily (Volatilità Implicita Giornaliera)
+```python
+# 📌 Origine IB: ticker 106 = IV% ANNUALE
+# IB fornisce SOLO la volatilità ANNUALE, NON daily!
+# Per ottenere la IV% DAILY dobbiamo calcolarla:
+#
+# IV_daily = IV_annuale / sqrt(252)
+#
+# Dove:
+# - IV_annuale = tick type 106 da IB (implied volatility annualizzata)
+# - 252 = giorni di trading in un anno
+# - sqrt(252) ≈ 15.8745
+
+import math
+iv_annual = ticker.impliedVolatility  # tick type 106
+iv_daily = iv_annual / math.sqrt(252)
+```
+- **REGOLA:** IB NON fornisce la IV% daily direttamente
+- **SEMPRE** dividere per √252 per avere il dato giornaliero
+- Questo valore serve per calcolare R1 UP/DOWN
 
 ---
 
@@ -56,6 +93,12 @@ Straddle BID = Call BID + Put BID
 Straddle SPREAD = Straddle ASK - Straddle BID
 ```
 
+### IV% Daily (da IB tick 106)
+```
+IV_annuale = tick type 106 da IB (impliedVolatility)
+IV_daily = IV_annuale / sqrt(252)
+```
+
 ### IV% Straddle
 ```
 # MATTINA (su VWAP ES)
@@ -65,15 +108,15 @@ IV% Straddle = (Straddle ASK × 100) / ES_VWAP
 IV% Straddle = (Straddle ASK × 100) / SPX_OPEN
 ```
 
-### Range R1 (basato su IV%)
+### Range R1 (basato su IV% Daily)
 ```
 # MATTINA
-R1 UP = ES_VWAP + (ES_VWAP × IV%)
-R1 DOWN = ES_VWAP - (ES_VWAP × IV%)
+R1 UP = ES_VWAP + (ES_VWAP × IV_daily)
+R1 DOWN = ES_VWAP - (ES_VWAP × IV_daily)
 
 # POMERIGGIO (calcolo su SPX, poi conversione)
-R1 UP (SPX) = SPX_OPEN + (SPX_OPEN × IV%)
-R1 DOWN (SPX) = SPX_OPEN - (SPX_OPEN × IV%)
+R1 UP (SPX) = SPX_OPEN + (SPX_OPEN × IV_daily)
+R1 DOWN (SPX) = SPX_OPEN - (SPX_OPEN × IV_daily)
 R1 UP (ES) = R1 UP (SPX) + SPREAD
 R1 DOWN (ES) = R1 DOWN (SPX) + SPREAD
 ```
@@ -140,7 +183,7 @@ ticker = ib.reqMktData(
 | 10:00 | Salva ES RANGE 10:00 (basato su VWAP ES) |
 | 15:30 | Registra SPX OPEN + Salva RANGE SPX/ES 15:30 |
 | 15:45 | Salva snapshot 15 min dopo apertura US |
-| Ogni 10s | Log in database (VWAP, IV%, Straddle, DVS, P/C Ratio) |
+| Ogni 10s | Log in database (VWAP, IV% Daily, IV% Straddle, Straddle, DVS, P/C Ratio) |
 
 ---
 
@@ -226,12 +269,15 @@ es-trading-dashboard/
 
 #### Fase 3: Data Collection
 - [ ] Market data subscriptions (NO SNAPSHOT!)
+- [ ] ES VWAP via RTVolume (tick 233 → ticker.vwap)
+- [ ] IV% annuale da tick 106 → calcolo daily con √252
 - [ ] Options chain fetcher (0DTE automatico)
-- [ ] ATM tracking dinamico
+- [ ] ATM tracking dinamico (strike ogni 5 punti)
 - [ ] Caching dati
 
 #### Fase 4: Calcoli
-- [ ] Range R1/R2 calculation (mattina/pomeriggio)
+- [ ] IV_daily = IV_annual / sqrt(252)
+- [ ] Range R1/R2 calculation (mattina VWAP / pomeriggio OPEN)
 - [ ] DVS calculation
 - [ ] Fibonacci extensions
 - [ ] SPREAD ES-SPX tracking
