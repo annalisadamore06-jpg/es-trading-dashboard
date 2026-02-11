@@ -1,203 +1,275 @@
-# es-trading-dashboard
+# ES/SPX Trading Dashboard - Sistema Istituzionale
 
-Real-time ES/SPX options trading dashboard with Interactive Brokers integration
+**Data aggiornamento:** 11 febbraio 2026
+**Versione specifica:** SPEC_LOCKED (vedi SPEC_LOCK.md)
 
----
-
-## COSTANTI E CONFIG (da run_dashboard_FINAL_FREEZE.py)
-
-```python
-IB_HOST = "127.0.0.1"
-IB_PORT = 7496
-CLIENT_ID = 30
-DASH_HOST = "127.0.0.1"
-DASH_PORT = 8050
-UPDATE_SEC = 10          # loop IB ogni 10 secondi
-UPDATE_MS = 10000        # refresh UI ogni 10 secondi
-RESELECT_POINTS = 10     # ricalcola strike ATM se ES si muove di 10+ punti
-SQRT_252 = 252**0.5      # = 15.8745 (radice quadrata giorni trading)
-FIB_UP = 1.618           # Fibonacci estensione UP
-FIB_DN = 0.618           # Fibonacci estensione DOWN
-T_1000 = (10, 0)         # snapshot ore 10:00 CET
-T_1530 = (15, 30)        # snapshot ore 15:30 CET (apertura US)
-T_1545 = (15, 45)        # snapshot ore 15:45 CET (15 min dopo apertura)
-```
+Sistema di trading istituzionale per ES/SPX con:
+- Dashboard real-time IB (02:15-22:00 Europe/Zurich)
+- MASTER_OUTPUT storico unico da dati Databento/GLBX, OI, GEXBot
+- Analisi statistica sui range (VWAP/OPEN) + IV/RV + OI + Gamma
+- Automazione setup via Algo Studio Pro (dopo ricerca su storico)
 
 ---
 
-## CONNESSIONE IB E CONTRATTI
+## Filosofia: Statistica Prima, Collector Dopo
 
-### ES Future (front month)
-```python
-cds = ib.reqContractDetails(Future("ES", "", "CME"))
-cds = sorted(cds, key=lambda x: x.contract.lastTradeDateOrContractMonth)
-es = cds[0].contract    # primo contratto = front month
-ib.qualifyContracts(es)
-```
+**Non siamo schiavi del collector.** Priorita:
+1. Costruire **MASTER_OUTPUT storico unico** da tutti i dati acquistati
+2. Analisi statistica robusta: range behavior, IV/RV, OI, gamma regime
+3. Identificare setup ad alto hedge su dati storici
+4. **Solo dopo:** costruire collector live che alimenta lo stesso schema dati
+5. Tradurre i setup migliori in regole deterministiche per **Algo Studio Pro**
 
-### ES Market Data (VWAP + IV)
-```python
-t_es = ib.reqMktData(es, genericTickList="233,106", snapshot=False)
-# 233 = RTVolume -> popola ticker.vwap
-# 106 = impliedVolatility (IV% ANNUALE)
-# snapshot=False SEMPRE! (NO SNAPSHOT = GRATIS)
-```
+---
 
-### SPX Index
-```python
-spx = Index("SPX", "CBOE")
-ib.qualifyContracts(spx)
-t_spx = ib.reqMktData(spx, snapshot=False)
-```
+## Trade Date e Orari (Europe/Zurich - Ora Italia)
 
-### Options Chain 0DTE (automatica)
-```python
-chains = ib.reqSecDefOptParams("ES", "CME", "FUT", es.conId)
-chain = next(c for c in chains if c.tradingClass == "E2B" and today in c.expirations)
-expiry = today  # 0DTE = scadenza oggi
-```
-- **TradingClass:** E2B (opzioni 0DTE su ES)
-- Il sistema trova automaticamente la scadenza di oggi nella chain
+Tutti gli orari sono in **Europe/Zurich (ora Italia)**:
+- **02:15** = 02:15 di notte (apertura chain ES 0DTE)
+- **10:00** = 10:00 mattina (foto VWAP ES)
+- **15:30** = 15:30 pomeriggio (open cash USA/SPX)
+- **22:00** = 22:00 sera (fine sessione operativa)
+- **22:01** = switch logico alla 0DTE del giorno successivo
 
-### ATM Strike Selection
-```python
-es_last = nn(t_es.last) or nn(t_es.close)
-strike = min(chain.strikes, key=lambda k: abs(k - es_last))
-anchor = es_last
-```
-- Strike ATM = la strike piu vicina a ES Last
-- **RESELECTION:** se ES si muove di 10+ punti dall'anchor, ricalcola strike ATM
+### Definizione trade_date
+- `trade_date` = market date della sessione **02:15-22:00**
+- Intervallo 00:00-02:14 appartiene ancora alla sessione precedente
+- Esempio: dati a 01:00 del 12 marzo -> trade_date = 2026-03-11
 
-### Options ATM (Call + Put)
+### 0DTE Selection Logic (robusta ai riavvii)
 ```python
-for exch in ("CME", "GLOBEX"):  # prova entrambi gli exchange
-    call = FuturesOption("ES", expiry, strike, "C", exch, tradingClass=chain.tradingClass)
-    put  = FuturesOption("ES", expiry, strike, "P", exch, tradingClass=chain.tradingClass)
-    ib.qualifyContracts(call, put)
-    tc = ib.reqMktData(call, genericTickList="101,106", snapshot=False)
-    tp = ib.reqMktData(put,  genericTickList="101,106", snapshot=False)
-    # 101 = option computed greeks
-    # 106 = impliedVolatility
+if now_local >= 22:01:   # Europe/Zurich
+    use next calendar expiry   # 0DTE di domani
+else:
+    use today's expiry         # 0DTE di oggi
 ```
 
 ---
 
-## DATI LIVE RACCOLTI OGNI 10 SECONDI
+## Sorgenti Dati
 
-```python
-es_last = nn(t_es.last) or nn(t_es.close)       # ES Last price
-es_vwap_live = nn(getattr(t_es, "vwap", None))   # ES VWAP (da tick 233)
-spx_last = nn(t_spx.last)                        # SPX Last price
-spread_live = es_last - spx_last                  # SPREAD = ES - SPX
-```
+### 1. IB Live (Collector)
+- ES future front-month rolling + SPX index
+- Frequenza: ogni 10 secondi
+- VWAP IB (tick 233), IV (tick 106), straddle ATM, range/touch
 
-### SPX OPEN Ufficiale (immutabile al giorno)
-```python
-# Dopo le 15:30 CET, UNA SOLA VOLTA al giorno:
-# 1) Prova ticker.open
-# 2) Fallback: reqHistoricalData daily bar useRTH=True -> bars[-1].open
-# Una volta registrato, NON cambia piu per tutto il giorno
-spx_open_official = STATE["spx_open_official"]
-```
+### 2. Databento / GLBX
+- **ES 1m OHLCV** (GLBX-MDP3): verita prezzi per RV e max/min 10-22
+- **ES OI EOD** (statistics): `.csv.zst`
+- **SPX options OI EOD** (OPRA pillar): `.csv.zst`
+- **SPX options CBBO 1m**: `.csv.zst` e `.dbn.zst`
 
----
+### 3. GEXBot quant-historical
+- Cartelle: `gamma_one`, `gamma_zero`, `delta_one`, `delta_zero`, `gex_full`, `vanna_*`, `charm_*`
+- CSV giornalieri (ES/SPX) ~60 giorni
+- Output: zero gamma, call/put walls, gamma regime
 
-## CALCOLI BLINDATI
+### 4. OI Runner (ES options)
+- `ES_OI_RAW_YYYY-MM-DD.csv`
+- `ES_OI_SUMMARY_YYYY-MM-DD.csv`
+- `ES_OI_DELTA_YYYY-MM-DD_vs_YYYY-MM-DD.csv`
+- `ES_OI_MASTER_RAW.csv` / `ES_OI_MASTER_SUMMARY.csv`
 
-### IV% Daily (da tick 106 IB)
-```python
-# IB fornisce IV% ANNUALE (tick 106 = impliedVolatility)
-# Se iv_raw < 1.0 -> moltiplica x100 (IB restituisce 0.xx)
-# Se iv_raw >= 1.0 -> gia in percentuale
-iv_raw = nn(getattr(t_es, "impliedVolatility", None))
-iv_annual_pct = (iv_raw * 100.0) if iv_raw < 1.0 else iv_raw
-iv_daily_pct = iv_annual_pct / SQRT_252   # /15.8745
-iv_daily_frac = iv_daily_pct / 100.0      # per calcoli
-```
+### Formati File
+- **Databento**: CSV compressi Zstandard `.csv.zst` + DBN `.dbn.zst`
+- **GEXBot**: CSV per giorno per metrica
+- **OI runner**: CSV daily + master
 
-### Straddle ATM (opzioni Call+Put sulla strike piu vicina)
-```python
-str_bid = call_bid + put_bid
-str_ask = call_ask + put_ask
-str_mid = (str_bid + str_ask) / 2.0
-str_spread = str_ask - str_bid
-pcr = put_mid / call_mid   # Put/Call Ratio
-```
-
-### IV% Straddle
-```python
-# MATTINA: base = ES VWAP
-# POMERIGGIO: base = SPX OPEN official
-iv_straddle_pct = (str_ask / base_live) * 100.0
-iv_straddle_frac = iv_straddle_pct / 100.0
-```
-
-### MODE (Mattina vs Pomeriggio)
-```python
-# DEFAULT = MORNING (VWAP ES)
-mode = "MORNING_ES_VWAP"
-base_live = es_vwap_live
-base_label_live = "VWAP"
-
-# Dopo 15:30 CET + SPX open disponibile + spread disponibile:
-if time_ge(T_1530) and spx_open_off not in (None,0) and spread_live is not None:
-    mode = "AFTERNOON_SPX_OPEN"
-    base_live = spx_open_off
-    base_label_live = "OPEN"
-```
-
-### Range R1 (basato su IV% Daily)
-```python
-r1_pts = base * iv_daily_frac
-R1_UP  = base + r1_pts
-R1_DN  = base - r1_pts
-```
-
-### Range R2 (basato su IV% Straddle)
-```python
-r2_pts = base * iv_straddle_frac
-R2_UP  = base + r2_pts
-R2_DN  = base - r2_pts
-```
-
-### Estensioni Fibonacci
-```python
-FIB_R1_UP = base + (r1_pts * 1.618)
-FIB_R1_DN = base - (r1_pts * 0.618)
-FIB_R2_UP = base + (r2_pts * 1.618)
-FIB_R2_DN = base - (r2_pts * 0.618)
-```
-
-### DVS (Dollar Value of Spread)
-```python
-dvs = (str_mid / r1_pts) * 100.0
-```
-
-### Conversione SPX -> ES (pomeriggio)
-```python
-def to_es(x, spread):
-    return x + spread   # livello_ES = livello_SPX + SPREAD
-```
+### Path Sorgenti
+- **OPRA grezzo**: `C:\Users\annal\Desktop\OPRA`
+- **GEXBot storico**: `C:\Users\annal\Desktop\GEX\quant-historical\data\ES_SPX\ES_SPX`
+- **Output pulito**: `C:\Users\annal\Desktop\DATA`
 
 ---
 
-## PANNELLI UI - ORDINE LIVELLI
+## Specifiche VWAP e OPEN (REGOLE BLINDATE)
 
+### VWAP ES (mattina)
+- **Sempre e solo** il valore IB ufficiale: `ticker.vwap` (tick 233 RTVolume)
+- **Mai** ricalcolato da noi
+- Se `None` nei primi minuti: logga `es_vwap_live=None`, ma continua a loggare ES_last/IV/straddle
+- Foto 10:00: aspetta fino a **10:05** max; se ancora None -> anomaly, niente foto valida
+
+### SPX OPEN (pomeriggio)
+- **Primo prezzo SPX** dopo le 15:30 (non l'open della candela daily)
+- Una volta registrato, **congelato per tutta la giornata**
+- Gerarchia fallback per SPX last-like:
+  1. `ticker.marketPrice()` se > 0
+  2. `ticker.midpoint()` se disponibile
+  3. `ticker.close` (prev close)
+  4. SPX marcato "non disponibile", logghi solo ES
+
+### SPX OPEN Source Tracking
+- `SPX_OPEN_SOURCE = REALTIME` -> ticker.open arrivato in tempo
+- `SPX_OPEN_SOURCE = HIST_DAILY` -> fallback su daily bar
+- `SPX_OPEN_SOURCE = MANUAL` -> emergenza, valore inserito manualmente
+
+---
+
+## Logica Range Mattina vs Pomeriggio
+
+### MATTINA (10:00-15:30)
+- **Base** = VWAP ES IB (live, in movimento)
+- **Foto 10:00 (IMMUTABILE)**:
+  - `VWAP_ES_10:00`
+  - `IV_DAILY_10:00`, `IV_STRADDLE_10:00`
+  - Range R1/R2/FIBO calcolati e congelati
+- **Live Mattina**:
+  - VWAP/IV si muovono
+  - Range ricalcolati dinamicamente su VWAP live
+
+### POMERIGGIO (15:30-22:00)
+- **Base** = SPX OPEN ufficiale (FISSO, non cambia piu)
+- **Foto 15:30 e 15:45 (IMMUTABILI)**:
+  - Base = SPX_OPEN_OFFICIAL
+  - IV, straddle, spread congelati al momento
+  - Range SPX calcolati
+  - Range ES = Range SPX + spread_fixed
+- **Live Pomeriggio**:
+  - Base = OPEN SPX (fisso)
+  - IV_daily e IV_straddle live
+  - Spread live
+  - Range SPX live -> proiettati su ES via spread live
+
+### Differenza Concettuale
+- **Live Mattina** = VWAP-centrico (ES), range centrati su flusso negoziazione
+- **Live Pomeriggio** = OPEN-centrico (SPX), range centrati su prezzo apertura USA
+
+---
+
+## Range Eventi (TOUCH/REJECT/BREAKOUT)
+
+### Livelli Tracciati (tutti)
+- `BASE` (CENTER = VWAP o OPEN)
+- `R1_UP`, `R1_DN`
+- `R2_UP`, `R2_DN`
+- `FIB_R1_UP`, `FIB_R1_DN`
+- `FIB_R2_UP`, `FIB_R2_DN`
+
+### Parametri
+- **Buffer**: 0.25 punti ES (parametrico in config)
+- **Cooldown**: 30 secondi (nuovo touch stesso livello solo dopo 30s)
+- **Breakout window**: 5 minuti
+
+### Definizioni
+- **Touch UP**: `last >= livello + buffer`
+- **Touch DOWN**: `last <= livello - buffer`
+- **Breakout**: 5 minuti **consecutivi** oltre il livello (ogni campione 10s deve rispettare)
+- **Reject**: torna dall'altra parte del livello entro 5 minuti
+
+### Campi Salvati per Ogni Livello
+- `touch_flag` (1/0)
+- `touch_count`
+- `first_touch_time_local`, `first_touch_time_utc`
+- `last_touch_time_local`, `last_touch_time_utc`
+- `has_reject` (1/0), `reject_time`
+- `has_breakout` (1/0), `breakout_time`
+- `time_from_range_birth_to_first_touch` (minuti)
+
+---
+
+## ATM Straddle 0DTE
+
+### Strike Grid
+- Strike ES = **griglia 5 punti**
+- ATM iniziale = strike multiplo di 5 piu vicino a ES_last
+
+### Ri-selezione Dinamica
+- ATM si muove **a gradini di 5 punti**
+- Quando ES passa il **midpoint** fra due strike -> ATM salta allo strike adiacente
+- Non fissiamo ATM alle 10:00: segue il future in modo dinamico
+
+### Straddle
+- `straddle = call_ask + put_ask` sullo strike ATM corrente
+- IV straddle: `(straddle_ask / base) * 100`
+
+---
+
+## Volatilita (IV & RV)
+
+### IV Daily (da IB)
 ```python
-ORDER_KEYS = [
-    "FIBO EST R1 UP",
-    "FIBO EST R2 UP",
-    "R1 UP",
-    "R2 UP",
-    "CENTER",         # = VWAP (mattina) o OPEN (pomeriggio)
-    "R2 DOWN",
-    "R1 DOWN",
-    "FIBO EST R2 DOWN",
-    "FIBO EST R1 DOWN"
-]
+iv_raw = ticker.impliedVolatility  # tick 106, annuale
+iv_annual_pct = iv_raw * 100 if iv_raw < 1.0 else iv_raw
+iv_daily_pct = iv_annual_pct / sqrt(252)  # /15.8745
 ```
 
-### 8 Colonne nella Dashboard
+### RV (Realized Volatility) - OFFLINE
+- Fonte: dati 1m esterni (Databento), **non** IB live
+- Calcolata in script notturno separato
+- 4 finestre:
+  - `RV_0215_2200` (sessione completa)
+  - `RV_1000_2200` (operativa)
+  - `RV_1000_1530` (morning)
+  - `RV_1530_2200` (afternoon)
+
+### Percentili
+- Rolling 60 e 120 giorni + full history dal 2024
+- IV percentile: su base giornaliera intera
+- DVS percentile: separato morning vs afternoon
+
+---
+
+## OI (Open Interest)
+
+### Fonte e Architettura
+- Fonte primaria: file esterni (OI runner + OPRA/Databento), **non** IB intraday
+- Strumento: ES options (FOP)
+- Finestra strike: **+/- 100 punti** attorno al last ES
+- Scadenze: 0DTE (fase 1), poi estensione fino a 1 anno
+
+### Snapshot (4 al giorno)
+- **02:15** (apertura sessione)
+- **10:00** (nascita foto mattina)
+- **15:30** (nascita foto pomeriggio)
+- **22:00** (chiusura giornata)
+
+### Campi per Snapshot
+- `oi_call_sum_100`, `oi_put_sum_100`
+- `call_wall_strike`, `call_wall_oi`
+- `put_wall_strike`, `put_wall_oi`
+- `delta_oi_call_vs_yesterday`, `delta_oi_put_vs_yesterday`
+- `delta_oi_call_vs_prev_snapshot`, `delta_oi_put_vs_prev_snapshot`
+
+---
+
+## GEX (Gamma Exposure)
+
+### Fonte
+- GEXBot daily profiles da `quant-historical\data\ES_SPX`
+- CSV giornalieri per metrica
+
+### Output Operativo
+- `zero_gamma_level`
+- `call_wall_level`, `put_wall_level`
+- `gamma_regime`: "pos" (mean-revert) o "neg" (trend)
+- `gamma_major_sign`
+
+### Integrazione
+- Un valore daily per trade_date, valido tutto il giorno
+- As-of join con daily_summary_master
+
+---
+
+## Max/Min e Finestra Operativa 10-22
+
+### Strumento e Finestra
+- Strumento: **ES**
+- Finestra: **10:00-22:00** Europe/Zurich (unica, non 10-20)
+
+### Campi
+- `MAX_10_22` = massimo ES tra 10:00 e 22:00
+- `MIN_10_22` = minimo ES tra 10:00 e 22:00
+- `MAX_10_22_TIME_local`, `MAX_10_22_TIME_utc`
+- `MIN_10_22_TIME_local`, `MIN_10_22_TIME_utc`
+
+### Uso
+- Misurare rotture ed estensioni dei range mattina/pomeriggio
+- Calcolare media estensioni nel tempo solo nell'orario operativo
+
+---
+
+## Riquadri Dashboard (8 Colonne)
 
 | # | Pannello | Tipo | Base | Dati |
 |---|----------|------|------|------|
@@ -210,102 +282,131 @@ ORDER_KEYS = [
 | 7 | ES 15:45 | FOTO | OPEN SPX + spread | IV+Straddle congelati 15:45 |
 | 8 | ES LIVE POMERIGGIO | LIVE | OPEN SPX + spread live | IV+Straddle live |
 
-**FOTO = snapshot immutabile** (congelato una volta al giorno)
-**LIVE = aggiornato ogni 10 secondi**
+**FOTO** = snapshot immutabile, congelato una volta al giorno
+**LIVE** = aggiornato ogni 10 secondi
 
 ---
 
-## SNAPSHOT FISSI (FOTO)
+## Schema Dati MASTER_OUTPUT
 
-### 10:00 CET - ES RANGE
-- Base = **ES VWAP live** (congelato alle 10:00)
-- IV% Daily = congelata alle 10:00
-- IV% Straddle = congelata alle 10:00
-- Range R1/R2/FIBO calcolati e congelati
-- Salvato UNA VOLTA al giorno, immutabile
+### 1. futures_1m_ES
+- `ts_utc`, `ts_local`, `trade_date`
+- `open`, `high`, `low`, `close`, `volume`
+- `symbol`
 
-### 15:30 CET - SPX/ES
-- Registra **SPX OPEN ufficiale** (immutabile al giorno)
-- **spread_fixed** = spread live al momento dello snap
-- **IV% Daily fixed** = IV% live al momento dello snap
-- **IV% Straddle fixed** = IV% straddle al momento dello snap
-- Calcola range su SPX (base = SPX OPEN)
-- Converte su ES con spread_fixed
-- Salva DOPPIO snapshot: SPX_15:30 e ES_15:30
+### 2. rv_daily
+- `trade_date`
+- `RV_0215_2200`, `RV_1000_2200`, `RV_1000_1530`, `RV_1530_2200`
+- `RV_PCTL_60D`, `RV_PCTL_120D`, `RV_PCTL_FULL`
 
-### 15:45 CET - SPX/ES (15 min dopo apertura)
-- Stessa logica del 15:30 ma con dati aggiornati alle 15:45
-- spread_fixed, IV, straddle congelati a quel momento
-- Salva DOPPIO snapshot: SPX_15:45 e ES_15:45
+### 3. oi_snapshots
+- `trade_date`, `snapshot_slot`, `expiry_bucket`
+- `oi_call_sum_100`, `oi_put_sum_100`
+- `call_wall_strike`, `put_wall_strike`
+- `delta_oi_*`
 
----
+### 4. gex_daily_summary
+- `trade_date`, `underlying`
+- `zero_gamma_level`, `call_wall_level`, `put_wall_level`
+- `gamma_regime`, `gamma_major_sign`
 
-## SEZIONI UI DASHBOARD
-
-### Sinistra (flex: 520px)
-1. **MERCATO LIVE** - ES last, SPX last, VWAP, OPEN, SPREAD, ATM strike, Exchange, Expiry, TradingClass
-2. **VOLATILITA LIVE** - IV daily%, IV straddle%, Straddle ASK/BID/MID/SPREAD, DVS, P/C ratio, MODE
-3. **LOG (ogni 10 secondi)** - tabella ultimi 40 record con colonne: DATE_TIME, VWAP, IV%, IV% STR, DVS, STR ASK, STR BID, STR SPR, P/C, MODE
-
-### Destra (flex: 1)
-- **8 colonne** LIVE e FOTO affiancate (display:flex, flexWrap:wrap)
+### 5. daily_summary_master
+Join as-of di tutte le tabelle con chiave `trade_date`
 
 ---
 
-## CSV - STORICIZZAZIONE
+## Pipeline End-to-End
 
-### Live Log (ogni 10 secondi)
-**File:** `live_log_10s.csv`
-```
-timestamp, mode, es_last, es_vwap_live, spx_last, spx_open_official,
-spread_live, iv_daily_pct_live, iv_straddle_pct_live,
-str_bid, str_mid, str_ask, str_spread, dvs, pcr
-```
-- Max 300 righe in memoria (ultimi 300 record)
-- Append continuo su file CSV
+### Fase 1 - Data Foundation (priorita attuale)
+1. **Ingest Databento/GLBX 1m** -> `futures_1m_ES`
+2. **RV job offline** -> `rv_daily` (4 finestre + percentili)
+3. **Ingest OI runner** -> `oi_snapshots` (4 slot, +/-100, delta OI)
+4. **Ingest GEXBot** -> `gex_daily_summary` (zero gamma, walls, regime)
+5. **Master builder** -> `daily_summary_master` (join as-of)
+6. **Export compatibilita** -> CSV per vecchio Excel (opzionale)
 
-### Snapshot (eventi fissi)
-**File:** `snapshots_fixed.csv`
-```
-timestamp, slot, date, base_label, base_value, spx_open_official,
-spread_fixed, iv_daily_pct_fixed, iv_straddle_pct_fixed,
-R1_UP, R2_UP, CENTER, R2_DN, R1_DN,
-FIB_R1_UP, FIB_R2_UP, FIB_R2_DN, FIB_R1_DN
-```
-- Slot: ES_10:00, SPX_15:30, ES_15:30, SPX_15:45, ES_15:45
+### Fase 2 - Research Setup
+- Feature engineering su `daily_summary_master`
+- Setup candidates: condizioni + contesto + trigger + gestione rischio
+- Backtest robusto: hit rate, excursion, tail risk, sensitivity a vol/gamma regime
+- Walk-forward 60/120 rolling
 
----
+### Fase 3 - Collector Live (dopo ricerca)
+- Moduli: `ib_live_collector.py`, `range_engine.py`, `snapshot_engine.py`
+- Output: `market_10s`, `range_events`, `range_snapshots`
+- Stesso schema del MASTER_OUTPUT offline
 
-## REGOLA CRITICA: NO SNAPSHOT IB!
-
-```python
-# snapshot=False    SEMPRE! (gratis con sottoscrizione)
-# snapshot=True     VIETATO! ($0.01/richiesta)
-# regulatorySnapshot=True  VIETATO! ($0.03/richiesta)
-```
+### Fase 4 - Algo Studio Pro
+- Traduzione setup robusti in regole deterministiche
+- Filtri: orari, macro day, gamma regime, vol percentile
+- Entry/exit basati su eventi range (touch/reject/breakout)
 
 ---
 
-## ARCHITETTURA RUNTIME
+## Versioning e Meta
 
-- **Thread 1:** `ib_worker()` - loop infinito connessione IB + raccolta dati + calcoli + CSV
-- **Thread 2:** `Dash app` - server web UI su porta 8050
-- Il worker scrive in `STATE` (dict globale), la UI legge da `STATE`
-- Update ogni 10 secondi (UPDATE_SEC=10, UPDATE_MS=10000)
+Ogni CSV/Parquet deve avere:
+- `MODEL_VERSION` (es. "RANGE_ENGINE_v1", "OFFLINE_MASTER_v1")
+- `CONFIG_HASH` (hash SHA256 del file config)
+- `ENGINE_START_TIME` (timestamp avvio)
+- Opzionalmente: `GIT_COMMIT_HASH`, `PYTHON_VERSION`, `IBINSYNC_VERSION`
 
 ---
 
-## DIPENDENZE
+## Validazione e Qualita
 
-```python
-from ib_insync import IB, util, Future, Index, FuturesOption
-import dash
-from dash import html, dcc
-from dash.dependencies import Input, Output
-import pandas as pd
-import math, csv, os, threading, datetime, logging
-from collections import OrderedDict
-```
+### Quality Score per trade_date
+- missing VWAP foto 10:00 -> hard fail
+- SPX last not available -> soft warning
+- gaps > N minuti nel log 10s -> warning
+- OI/RV/GEX snapshot missing -> warning
+- config hash mismatch -> hard fail
+
+### File Immutabili
+- Dopo finalize 22:01 -> file read-only
+- Correzioni: solo via rebuild da raw, mai edit manuale
+
+---
+
+## Macro/Earnings (Step 2)
+
+### Eventi Macro USA
+- Solo **high impact** (3 stelline): CPI, NFP, FOMC, ADP, GDP, PCE
+- CSV statico `US_MACRO_EVENTS_YYYY-YYYY.csv`
+- Aggiornamento manuale ogni trimestre
+
+### Earnings
+- Watchlist ristretta: Big 7 + mega cap impattanti
+- CSV `BIG_EARNINGS_YYYY-YYYY.csv`
+
+### Scheda Giornaliera
+- Pagina nella dashboard (in italiano) con:
+  - Eventi macro di oggi
+  - Earnings principali
+  - Contesto range/vol/OI/GEX
+- Live durante la giornata, finalizzata alle 22:01
+- Export CSV scaricabile
+
+---
+
+## Health Panel
+
+Monitora:
+- Connessione IB (stato, errori)
+- Ultimo tick ES/SPX (timestamp, ritardo)
+- Scrittura file (timestamp ultima riga)
+- Status OI runner, RV script
+
+---
+
+## Config
+
+File `settings.yaml` con parametri:
+- `buffer`: 0.25
+- `cooldown_seconds`: 30
+- `breakout_window_minutes`: 5
+- `strike_window_OI_points`: 100
+- Path sorgenti/output
 
 ---
 
@@ -316,3 +417,28 @@ pip install -e .
 python run_dashboard_FINAL_FREEZE.py
 # Dashboard su http://127.0.0.1:8050
 ```
+
+---
+
+## Note Tecniche
+
+### Regola Critica: NO SNAPSHOT IB!
+```python
+# snapshot=False SEMPRE! (gratis con sottoscrizione)
+# snapshot=True VIETATO! ($0.01/richiesta)
+# regulatorySnapshot=True VIETATO! ($0.03/richiesta)
+```
+
+### Thread Worker IB
+Ogni thread con `IB()` deve avere:
+```python
+import asyncio
+def ib_worker():
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    # ... connect, reqMktData, ecc.
+```
+Mai `util.startLoop()` negli script (solo notebook Jupyter).
+
+---
+
+**SPEC_LOCKED: 11 febbraio 2026**
